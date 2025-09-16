@@ -4,6 +4,8 @@ FastAPI microservice for generating embeddings from images and text using CLIP m
 
 import io
 import logging
+import time
+import asyncio
 from typing import List, Optional, Union
 import requests
 import torch
@@ -57,29 +59,78 @@ class ErrorEntry(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """Load CLIP model on startup."""
+    """Load CLIP model on startup with retry logic and fallback options."""
     global model, preprocess, tokenizer
     
-    try:
-        logger.info("Loading CLIP model (ViT-B/32, laion400m)...")
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            'ViT-B-32', 
-            pretrained='laion400m_e32'
-        )
-        tokenizer = open_clip.get_tokenizer('ViT-B-32')
-        
-        # Set model to evaluation mode
-        model.eval()
-        
-        # Move to CPU (default)
-        device = torch.device('cpu')
-        model = model.to(device)
-        
-        logger.info(f"CLIP model loaded successfully on {device}")
-        
-    except Exception as e:
-        logger.error(f"Failed to load CLIP model: {e}")
-        raise RuntimeError(f"Model initialization failed: {e}")
+    # Model configurations to try in order of preference
+    model_configs = [
+        {'model': 'ViT-B-32', 'pretrained': 'laion400m_e32', 'name': 'ViT-B/32 (laion400m)'},
+        {'model': 'ViT-B-32', 'pretrained': 'openai', 'name': 'ViT-B/32 (OpenAI)'},
+        {'model': 'ViT-B-32', 'pretrained': None, 'name': 'ViT-B/32 (no pretrained weights)'},
+        {'model': 'ViT-L-14', 'pretrained': 'openai', 'name': 'ViT-L/14 (OpenAI)'},
+    ]
+    
+    for config in model_configs:
+        try:
+            logger.info(f"Attempting to load CLIP model: {config['name']}...")
+            model, _, preprocess = await load_model_with_retry(
+                config['model'], 
+                config['pretrained'],
+                max_retries=3,
+                base_delay=2.0
+            )
+            tokenizer = open_clip.get_tokenizer(config['model'])
+            
+            # Set model to evaluation mode
+            model.eval()
+            
+            # Move to CPU (default)
+            device = torch.device('cpu')
+            model = model.to(device)
+            
+            logger.info(f"CLIP model loaded successfully: {config['name']} on {device}")
+            return
+            
+        except Exception as e:
+            logger.warning(f"Failed to load {config['name']}: {e}")
+            continue
+    
+    # If all models failed to load
+    raise RuntimeError("Failed to load any CLIP model configuration. Please check your internet connection and try again.")
+
+
+async def load_model_with_retry(model_name: str, pretrained: Optional[str], max_retries: int = 3, base_delay: float = 2.0):
+    """Load model with exponential backoff retry logic."""
+    
+    for attempt in range(max_retries):
+        try:
+            # Add a small random delay to avoid thundering herd
+            if attempt > 0:
+                delay = base_delay * (2 ** (attempt - 1)) + (torch.rand(1).item() * 0.5)
+                logger.info(f"Retrying model load in {delay:.1f} seconds (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(delay)
+            
+            # Try to load the model
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                model_name, 
+                pretrained=pretrained
+            )
+            
+            return model, _, preprocess
+            
+        except Exception as e:
+            if attempt == max_retries - 1:
+                # Last attempt failed, re-raise the exception
+                raise e
+            
+            # Check if it's a rate limiting error
+            error_str = str(e).lower()
+            if "429" in error_str or "too many requests" in error_str:
+                logger.warning(f"Rate limited while loading model (attempt {attempt + 1}/{max_retries}): {e}")
+            else:
+                logger.warning(f"Error loading model (attempt {attempt + 1}/{max_retries}): {e}")
+    
+    raise RuntimeError(f"Failed to load model after {max_retries} attempts")
 
 def normalize_embeddings(embeddings: torch.Tensor) -> torch.Tensor:
     """Normalize embeddings by L2 norm."""
@@ -284,6 +335,43 @@ async def embed_mixed(request: MixedEmbeddingRequest):
         image_embeddings=image_embeddings
     )
 
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Cloud Run."""
+    if model is None:
+        raise HTTPException(status_code=503, detail="Service not ready - model not loaded")
+    
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "tokenizer_loaded": tokenizer is not None,
+        "preprocess_loaded": preprocess is not None
+    }
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with service information."""
+    return {
+        "service": "CLIP Embedding Service",
+        "version": "1.0.0",
+        "model_loaded": model is not None,
+        "endpoints": {
+            "text_embeddings": "/embed/text",
+            "image_embeddings": "/embed/image", 
+            "mixed_embeddings": "/embed/mixed",
+            "health": "/health"
+        }
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8080,
+        log_level="info",
+        access_log=True
+    )
