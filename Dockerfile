@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements_v2.txt
 
 # Copy application code
-COPY m-clip.py .
+COPY app.py .
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app && \
